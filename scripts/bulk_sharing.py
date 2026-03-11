@@ -24,6 +24,7 @@
 # **Requirements:**
 # - The running account must be a member of every target group.
 # - Items must be owned by the running account.
+# - Export toggle (`enable_export`) only applies to Feature Service items.
 #
 # ---
 #
@@ -68,12 +69,18 @@ RULES = [
         "groups": [
             "Geospatial Hub Editors",
         ],
+        # ── Export / download toggle (optional) ───────────────────
+        # True  → add "Extract" capability (Feature Services only)
+        # False → remove "Extract" capability
+        # omit  → leave capabilities unchanged
+        "enable_export": True,
     },
     # ── Copy the block above to add more rules ───────────────────
     # {
     #     "tags": ["syr", "overture maps"],
     #     "level": "",
     #     "groups": ["Syria Geospatial Data Hub Editors"],
+    #     "enable_export": False,
     # },
 ]
 
@@ -88,6 +95,7 @@ import warnings
 import logging
 from urllib3.exceptions import InsecureRequestWarning
 from tqdm.notebook import tqdm
+from arcgis.features import FeatureLayerCollection
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -197,7 +205,38 @@ def validate_rules(rules):
                 f"Rule {i}: level='private' removes all group sharing — "
                 "listing groups is contradictory."
             )
+        enable_export = rule.get("enable_export")
+        if enable_export is not None and not isinstance(enable_export, bool):
+            errors.append(
+                f"Rule {i}: 'enable_export' must be True or False "
+                f"(got {enable_export!r})."
+            )
     return errors
+
+
+def get_capabilities(flc):
+    """Return the current capabilities of a FeatureLayerCollection as a set."""
+    raw = flc.properties.get("capabilities", "")
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
+def set_export(item, enable):
+    """Add or remove the 'Extract' capability on a Feature Service."""
+    flc = FeatureLayerCollection.fromitem(item)
+    current_caps = get_capabilities(flc)
+    has_extract = "Extract" in current_caps
+    if enable and has_extract:
+        return "SKIP", current_caps, current_caps
+    if not enable and not has_extract:
+        return "SKIP", current_caps, current_caps
+    new_caps = set(current_caps)
+    if enable:
+        new_caps.add("Extract")
+    else:
+        new_caps.discard("Extract")
+    caps_str = ",".join(sorted(new_caps))
+    flc.manager.update_definition({"capabilities": caps_str})
+    return "OK", current_caps, new_caps
 
 
 config_errors = validate_rules(RULES)
@@ -211,18 +250,21 @@ if DRY_RUN:
     print("── DRY RUN ── no changes will be made ──\n")
 
 # %%
-counts = {"ok": 0, "skip": 0, "dry_run": 0, "error": 0, "group_warn": 0}
+counts = {"ok": 0, "skip": 0, "dry_run": 0, "error": 0, "group_warn": 0,
+          "export_ok": 0, "export_skip": 0, "export_dry": 0, "export_error": 0}
 results_log = []
 level_log = []
+export_log = []
 
 for rule in RULES:
     required_tags = rule["tags"]
     target_group_names = rule["groups"]
     sharing_level = (rule.get("level") or "").strip() or None
+    enable_export = rule.get("enable_export")
 
     log.info(
         f"Rule | tags={required_tags} | level={sharing_level} "
-        f"| groups={target_group_names}"
+        f"| groups={target_group_names} | enable_export={enable_export}"
     )
 
     target_groups = [g for name in target_group_names if (g := get_group(name))]
@@ -235,7 +277,9 @@ for rule in RULES:
     log.info(f"Matched {len(matched)} item(s)")
 
     tag_label = ", ".join(required_tags)
+    export_label = {True: "enable", False: "disable", None: "—"}[enable_export]
     print(f"\n  Rule: tags=[{tag_label}]  level={sharing_level or '—'}"
+          f"  export={export_label}"
           f"  →  {len(matched)} item(s), {len(target_groups)} group(s)")
 
     for item in tqdm(matched, desc=f"[{tag_label}]", unit="item"):
@@ -245,6 +289,10 @@ for rule in RULES:
             for group in target_groups:
                 results_log.append((item.title, group.title, "DRY RUN", ""))
                 counts["dry_run"] += 1
+            if enable_export is not None and item.type == "Feature Service":
+                action = "enable" if enable_export else "disable"
+                export_log.append((item.title, action, "DRY RUN", ""))
+                counts["export_dry"] += 1
             continue
 
         if sharing_level:
@@ -274,6 +322,23 @@ for rule in RULES:
                     results_log.append((item.title, group.title, "ERROR", str(e)))
                     counts["error"] += 1
 
+        if enable_export is not None and item.type == "Feature Service":
+            action = "enable" if enable_export else "disable"
+            try:
+                status, old_caps, new_caps = set_export(item, enable_export)
+                if status == "SKIP":
+                    export_log.append((item.title, action, "SKIP", ""))
+                    counts["export_skip"] += 1
+                    log.debug(f"SKIP export | {item.title!r} (already {action}d)")
+                else:
+                    export_log.append((item.title, action, "OK", f"{old_caps} → {new_caps}"))
+                    counts["export_ok"] += 1
+                    log.info(f"OK export | {item.title!r} | {old_caps} → {new_caps}")
+            except Exception as e:
+                export_log.append((item.title, action, "ERROR", str(e)))
+                counts["export_error"] += 1
+                log.error(f"ERROR export | {item.title!r}: {e}")
+
 # %%
 val_results = []
 
@@ -290,6 +355,8 @@ if not DRY_RUN:
         matched = [i for i in candidates if item_has_all_tags(i, required_tags)]
         target_groups = [g for name in target_group_names if (g := get_group(name))]
 
+        enable_export = rule.get("enable_export")
+
         for item in tqdm(matched, desc="Validating", unit="item"):
             fresh = gis.content.get(item.id)
             shared_group_ids = get_shared_group_ids(fresh)
@@ -300,6 +367,22 @@ if not DRY_RUN:
                     f"{'PASS' if passed else 'FAIL'} | "
                     f"{fresh.title!r} ∈ '{group.title}'"
                 )
+
+            if enable_export is not None and fresh.type == "Feature Service":
+                action = "enable" if enable_export else "disable"
+                try:
+                    flc = FeatureLayerCollection.fromitem(fresh)
+                    caps = get_capabilities(flc)
+                    has_extract = "Extract" in caps
+                    passed_export = (has_extract == enable_export)
+                    val_results.append((fresh.title, f"Extract ({action})", passed_export))
+                    log.debug(
+                        f"{'PASS' if passed_export else 'FAIL'} | "
+                        f"{fresh.title!r} Extract={'present' if has_extract else 'absent'}"
+                    )
+                except Exception as e:
+                    val_results.append((fresh.title, f"Extract ({action})", False))
+                    log.error(f"Validation error for export on {fresh.title!r}: {e}")
 
 val_pass = sum(1 for *_, p in val_results if p)
 val_fail = sum(1 for *_, p in val_results if not p)
@@ -315,6 +398,16 @@ print(f"""
 │  ⊘  Skipped     : {counts['skip']:<14}│
 │  ✗  Errors      : {counts['error']:<14}│
 │  ⚠  Bad groups  : {counts['group_warn']:<14}│""")
+
+if any(counts[k] for k in ("export_ok", "export_skip", "export_dry", "export_error")):
+    print(f"""\
+├──────────────────────────────────┤
+│  Export Toggle                   │
+│  ✓  Toggled     : {counts['export_ok']:<14}│
+│  ⊘  Skipped     : {counts['export_skip']:<14}│
+│  ✗  Errors      : {counts['export_error']:<14}│""")
+    if DRY_RUN:
+        print(f"│  ○  Previewed   : {counts['export_dry']:<14}│")
 
 if not DRY_RUN and val_results:
     print(f"""\
@@ -347,6 +440,17 @@ if results_log:
         )
         print(f"  {icon}  {status:<8}  {item_title!r} → '{group_title}'{detail_str}")
 
+if export_log:
+    print("\n── Export Toggle ─────────────────────────────────────────────────────")
+    for item_title, action, status, detail in export_log:
+        icon = STATUS_ICONS.get(status, "?")
+        detail_str = (
+            f"  ({detail})" if detail and status == "OK"
+            else f"  ← {detail}" if detail
+            else ""
+        )
+        print(f"  {icon}  {status:<8}  {item_title!r} → {action} Extract{detail_str}")
+
 if not DRY_RUN and val_results:
     print("\n── Validation ────────────────────────────────────────────────────────")
     for item_title, group_title, passed in val_results:
@@ -354,7 +458,7 @@ if not DRY_RUN and val_results:
         print(f"  {icon}  {item_title!r} → '{group_title}'")
 
 print(f"\n  Log → {LOG_FILE}")
-if counts["error"] or val_fail:
+if counts["error"] or counts["export_error"] or val_fail:
     print(f"  ⚠  Issues detected — review log: cat {LOG_FILE}")
 
 for handler in log.handlers[:]:
